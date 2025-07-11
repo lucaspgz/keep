@@ -436,7 +436,7 @@ def assign_alert(
     enrichment_bl = EnrichmentsBl(tenant_id)
     enrichment_bl.enrich_entity(
         fingerprint=fingerprint,
-        enrichments=enrichments,
+        enrichments_list=enrichments,
         action_type=ActionType.ACKNOWLEDGE,
         action_description=f"Alert assigned to {user_email}, status: {status}",
         action_callee=user_email,
@@ -909,7 +909,7 @@ def batch_enrich_alerts(
 
         enrichment_bl.batch_enrich(
             fingerprints=fingerprints,
-            enrichments=enrichments,
+            enrichments_list=enrichments, 
             action_type=action_type,
             action_callee=authenticated_entity.email,
             action_description=action_description,
@@ -933,7 +933,7 @@ def batch_enrich_alerts(
             ]
             enrichment_bl.batch_enrich(
                 fingerprints=formatted_alert_ids,
-                enrichments=enrichments,
+                enrichments_list=enrichments,
                 action_type=action_type,
                 action_callee=authenticated_entity.email,
                 action_description=action_description,

@@ -89,18 +89,16 @@ export function AlertDismissModal({
     const dismissUntil =
       selectedTab === 0 ? null : selectedDateTime?.toISOString();
 
-    const enrichments: {
-      dismissed: boolean;
-      note: string;
-      dismissUntil: string;
-    } = {
-      dismissed: !alerts[0]?.dismissed,
+    const enrichmentsArray = alerts.map((alert: AlertDto) => ({
+      dismissed: !alert.dismissed,
       note: dismissComment,
       dismissUntil: dismissUntil || "",
-    };
+      previous_status: alert.status, // save actual status
+    }));
+
 
     const requestData = {
-      enrichments: enrichments,
+      enrichments: enrichmentsArray,
       fingerprints: alerts.map((alert: AlertDto) => alert.fingerprint),
     };
 
@@ -149,7 +147,7 @@ export function AlertDismissModal({
       beforeTitle={alerts?.[0]?.name}
       title="Dismiss Alert"
     >
-      {alerts && alerts.length == 1 && alerts[0].dismissed ? (
+      {alerts && alerts.length > 1 && alerts.every((alert) => alert.dismissed) ? (
         <>
           <Subtitle className="text-center">
             Are you sure you want to restore this alert?
