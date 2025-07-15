@@ -1378,18 +1378,33 @@ def batch_enrich(
     audit_enabled=True,
 ):
     """
-    Batch enrich multiple alerts with individual enrichments.
-    """
-    if len(fingerprints) != len(enrichments_list):
-        raise ValueError("Fingerprints and enrichments lists must be the same lenght.")
+    Batch enrich multiple alerts with the same enrichments in a single transaction.
 
-    # Normalizar cada enriquecimiento
+    Args:
+        tenant_id (str): The tenant ID to filter the alert enrichments by.
+        fingerprints (List[str]): List of alert fingerprints to enrich.
+        enrichments_list (List[Dict[str, Any]]): List of enrichments, one per fingerprint.
+        action_type (ActionType): The type of action being performed.
+        action_callee (str): The ID of the user performing the action.
+        action_description (str): Description of the action.
+        session (Session, optional): Database session to use.
+        audit_enabled (bool, optional): Whether to create audit entries. Defaults to True.
+
+    Returns:
+        List[AlertEnrichment]: List of enriched alert objects.
+    """
+
+    # Validate that the fingerprints and enrichments_list have the same length
+    if len(fingerprints) != len(enrichments_list):
+        raise ValueError("Fingerprints and enrichments lists must be the same length.")
+
+    # Normalize each enrichment to ensure consistent format
     normalized_enrichments = [
         normalize_enrichments(enrichments) for enrichments in enrichments_list
     ]
 
     with existed_or_new_session(session) as session:
-        # Obtener existentes
+        # Get all existing enrichments in one query
         existing_enrichments = {
             e.alert_fingerprint: e
             for e in session.exec(
@@ -1399,17 +1414,22 @@ def batch_enrich(
             ).all()
         }
 
-        # Actualizar cada registro individualmente
+        # List to hold audit entries if auditing is enabled
+        audit_entries = []
+
+        # Update each record individually
         for idx, fingerprint in enumerate(fingerprints):
             enrichments = normalized_enrichments[idx]
             existing = existing_enrichments.get(fingerprint)
             if existing:
+                # Update existing enrichment
                 session.execute(
                     update(AlertEnrichment)
                     .where(AlertEnrichment.id == existing.id)
                     .values(enrichments=enrichments)
                 )
             else:
+                # Create new enrichment record
                 session.add(
                     AlertEnrichment(
                         tenant_id=tenant_id,
@@ -1418,9 +1438,26 @@ def batch_enrich(
                     )
                 )
 
+            # Create audit entry if enabled
+            if audit_enabled:
+                audit_entries.append(
+                    AlertAudit(
+                        tenant_id=tenant_id,
+                        fingerprint=fingerprint,
+                        user_id=action_callee,
+                        action=action_type.value,
+                        description=action_description,
+                    )
+                )
+
+        # Insert audit entries in batch if any
+        if audit_enabled and audit_entries:
+            session.add_all(audit_entries)
+
+        # Commit all changes
         session.commit()
 
-        # Devolver los objetos actualizados o insertados
+        # Return all updated or inserted enrichments
         result = session.exec(
             select(AlertEnrichment)
             .where(AlertEnrichment.tenant_id == tenant_id)

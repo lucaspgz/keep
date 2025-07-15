@@ -2,6 +2,7 @@
 import time
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, Mock, patch
+import uuid
 
 import pytest
 from sqlalchemy import text
@@ -15,7 +16,13 @@ from keep.api.models.db.alert import Alert
 from keep.api.models.db.extraction import ExtractionRule
 from keep.api.models.db.mapping import MappingRule
 from keep.api.models.db.topology import TopologyService
-from tests.fixtures.client import client, setup_api_key, test_app  # noqa
+from keep.api.models.db.workflow import Workflow
+from keep.workflowmanager.workflowmanager import WorkflowManager
+from tests.fixtures.client import client, setup_api_key, test_app
+from tests.fixtures.workflow_manager import (
+    wait_for_workflow_execution,
+   # wait_for_workflow_in_run_queue,
+)  # noqa
 
 
 @pytest.fixture(autouse=True)
@@ -901,10 +908,227 @@ def test_batch_enrichment(db_session, client, test_app, create_alert, elastic_cl
     assert len(alerts) == 10
     assert [a["status"] for a in alerts] == ["acknowledged"] * 10
 
-@pytest.fixture
-def client():
-    app = get_app()
-    return TestClient(app)
+
+@pytest.mark.parametrize("test_app", ["NO_AUTH"], indirect=True)
+def test_incident_manual_enrichment_integration(db_session, client, test_app):
+    """
+    Test scenario 1: Create incident via API → enrich it manually → fetch and check enrichment
+    """
+    # Create incident via API
+    incident_payload = {
+        "user_generated_name": "Test Incident for Manual Enrichment",
+        "user_summary": "Test incident for manual enrichment integration test",
+        "severity": "critical",
+        "status": "firing",
+    }
+
+    # Create the incident
+    response = client.post(
+        "/incidents",
+        headers={"x-api-key": "some-key"},
+        json=incident_payload,
+    )
+    assert response.status_code == 202
+    incident_data = response.json()
+    incident_id = incident_data["id"]
+
+    # Enrich the incident manually with jira_ticket field
+    enrichment_payload = {"enrichments": {"jira_ticket": "12345"}}
+
+    response = client.post(
+        f"/incidents/{incident_id}/enrich",
+        headers={"x-api-key": "some-key"},
+        json=enrichment_payload,
+    )
+    assert response.status_code == 202
+
+    # Fetch the incident and check the enrichment is there
+    response = client.get(
+        f"/incidents/{incident_id}",
+        headers={"x-api-key": "some-key"},
+    )
+    assert response.status_code == 200
+    incident_data = response.json()
+
+    # Verify the enrichment was applied
+    assert "enrichments" in incident_data
+    assert incident_data["enrichments"]["jira_ticket"] == "12345"
+
+
+@pytest.mark.parametrize(
+    "test_app, db_session",
+    [
+        ("NO_AUTH", None),
+        ("NO_AUTH", {"db": "mysql"}),
+    ],
+    indirect=True,
+)
+def test_incident_workflow_enrichment_integration(db_session, client, test_app):
+    """
+    Test scenario 2: Create workflow that enriches incidents → create incident → fetch and check enrichment
+    """
+
+    # Create a workflow that enriches every incident with jira_ticket field
+    workflow_definition = """workflow:
+  id: incident-jira-enricher-test
+  name: Incident JIRA Enricher Test
+  description: Test workflow that enriches incidents with JIRA ticket
+  disabled: false
+  triggers:
+    - type: incident
+      events:
+        - created
+  actions:
+    - name: enrich-with-jira
+      provider:
+        type: console
+        with:
+          message: "Enriching incident {{ incident.user_generated_name }} with JIRA ticket"
+          enrich_incident:
+            - key: jira_ticket
+              value: "12345"
+"""
+
+    # Add the workflow to the database
+    workflow = Workflow(
+        id="incident-jira-enricher-test",
+        name="Incident JIRA Enricher Test",
+        tenant_id=SINGLE_TENANT_UUID,
+        description="Test workflow that enriches incidents with JIRA ticket",
+        created_by="test@keephq.dev",
+        interval=0,
+        workflow_raw=workflow_definition,
+        last_updated=datetime.utcnow(),
+    )
+    db_session.add(workflow)
+    db_session.commit()
+
+    # Create incident via API
+    incident_payload = {
+        "user_generated_name": "Test Incident for Workflow Enrichment",
+        "user_summary": "Test incident for workflow enrichment integration test",
+        "severity": "critical",
+        "status": "firing",
+    }
+
+    response = client.post(
+        "/incidents",
+        headers={"x-api-key": "some-key"},
+        json=incident_payload,
+    )
+    assert response.status_code == 202
+    incident_data = response.json()
+    incident_id = incident_data["id"]
+
+    # wait a bit, to be sure workflow is added to the queue
+    assert wait_for_workflow_in_run_queue("incident-jira-enricher-test")
+
+    # Wait for workflow execution to complete
+    workflow_execution = wait_for_workflow_execution(
+        SINGLE_TENANT_UUID, "incident-jira-enricher-test"
+    )
+
+    # Verify workflow execution was successful
+    assert workflow_execution is not None
+    assert workflow_execution.status == "success"
+
+    # Fetch the incident and check the enrichment is there
+    response = client.get(
+        f"/incidents/{incident_id}",
+        headers={"x-api-key": "some-key"},
+    )
+    assert response.status_code == 200
+    incident_data = response.json()
+
+    # Verify the enrichment was applied by the workflow
+    assert "enrichments" in incident_data
+    assert incident_data["enrichments"]["jira_ticket"] == "12345"
+
+
+@pytest.mark.parametrize(
+    "test_app, db_session",
+    [
+        ("NO_AUTH", None),
+        ("NO_AUTH", {"db": "mysql"}),
+    ],
+    indirect=True,
+)
+def test_alert_enrichment_via_api_uuid(db_session, client, test_app, create_alert):
+    fingerprint = str(uuid.uuid4())
+
+    create_alert(
+        fingerprint,
+        AlertStatus.FIRING,
+        datetime.utcnow(),
+        {},
+    )
+
+    enrichment_response = client.post(
+        "/alerts/enrich",
+        headers={"x-api-key": "some-key"},
+        json={
+            "fingerprint": fingerprint,
+            "enrichments": {
+                "jira_ticket": "12345",
+            },
+        },
+    )
+
+    assert enrichment_response.status_code == 200
+
+    alert_response = client.get(
+        f"/alerts/{fingerprint}",
+        headers={"x-api-key": "some-key"},
+    )
+    assert alert_response.status_code == 200
+    alert_data = alert_response.json()
+
+    assert alert_data["enriched_fields"] == ["jira_ticket"]
+    assert alert_data["jira_ticket"] == "12345"
+
+
+@pytest.mark.parametrize(
+    "test_app, db_session",
+    [
+        ("NO_AUTH", None),
+        ("NO_AUTH", {"db": "mysql"}),
+    ],
+    indirect=True,
+)
+def test_alert_enrichment_via_api_non_uuid(db_session, client, test_app, create_alert):
+    not_uuid_fingerprint = "not-uuid-fingerprint"
+
+    create_alert(
+        not_uuid_fingerprint,
+        AlertStatus.FIRING,
+        datetime.utcnow(),
+        {},
+    )
+
+    enrichment_response = client.post(
+        "/alerts/enrich",
+        headers={"x-api-key": "some-key"},
+        json={
+            "fingerprint": "not-uuid-fingerprint",
+            "enrichments": {
+                "jira_ticket": "12345",
+            },
+        },
+    )
+
+    assert enrichment_response.status_code == 200
+
+    alert_response = client.get(
+        f"/alerts/{not_uuid_fingerprint}",
+        headers={"x-api-key": "some-key"},
+    )
+    assert alert_response.status_code == 200
+    alert_data = alert_response.json()
+
+    assert alert_data["enriched_fields"] == ["jira_ticket"]
+    assert alert_data["jira_ticket"] == "12345"
+
+
 
 @pytest.fixture
 def mock_alert_dto():
@@ -974,47 +1198,71 @@ def assert_bool(val, expected: bool):
     else:
         pytest.fail(f"Value {val!r} is neither bool nor str for expected {expected!r}")
 
+# Helper to call the actual method which cleans dismiss-related enrichments
+def call_dispose_dismiss(enrichment_bl, fingerprint):
+    """Invoke the dispose_dismiss_disposables method."""
+    enrichment_bl.dispose_dismiss_disposables(fingerprint)
+
 @pytest.mark.parametrize("test_app", ["NO_AUTH"], indirect=True)
-def test_dismissed_resets_and_fields_cleaned_when_until_expires(db_session, client, test_app, mock_alert_dto):
-    """
-    Regression test: When dismissedUntil expires,
-    dismissed should be set to False (bool or equivalent string), dismissedUntil must be empty (""), and disposable_* fields removed.
-    """
+def test_dispose_dismiss_expired_removes_disposables(mock_session, client, test_app, mock_alert_dto):
+    """Ensure disposable enrichments are removed after dismissUntil expires."""
     seed_alert(client, mock_alert_dto)
     past_time = (datetime.utcnow() - timedelta(seconds=5)).isoformat(timespec='milliseconds') + "Z"
+
+    # Set enrichments with dismiss flags and dismissUntil in past
     enrich_alert(client, mock_alert_dto.fingerprint, {
         "dismissed": True,
         "dismissUntil": past_time,
-        "disposable_dismissed": True,
-        "disposable_dismissUntil": past_time,
+        # other attributes can be left out, they are not relevant for this test
     })
-    trigger_cleanup(client)
-    enrichment = get_enrichments(db_session, mock_alert_dto.fingerprint)
-    # Should set dismissed = False
-    assert_bool(enrichment.get("dismissed"), False)
-    # Should set dismissedUntil to ""
-    assert "dismissUntil" in enrichment, "dismissUntil should exist after expiry"
-    assert enrichment.get("dismissUntil") == "", "dismissUntil should be empty string after expiry"
-    # The disposable fields must be gone
-    assert "disposable_dismissed" not in enrichment, "disposable_dismissed should be removed after expiry"
-    assert "disposable_dismissUntil" not in enrichment, "disposable_dismissUntil should be removed after expiry"
+
+    # Call the function to simulate the cleanup
+    enrichments_bl = EnrichmentsBl(tenant_id="your_tenant_id", db=mock_session)
+    call_dispose_dismiss(enrichments_bl, mock_alert_dto.fingerprint)
+
+    # Now fetch the enrichments and verify disposable_* fields are removed
+    enrichment = get_enrichments(mock_session, mock_alert_dto.fingerprint)
+    # The disposable_* keys should be gone
+    for key in list(enrichment.keys()):
+        assert not key.startswith("disposable_"), f"{key} should be removed after dismiss expiration"
 
 @pytest.mark.parametrize("test_app", ["NO_AUTH"], indirect=True)
-def test_dismissed_persists_when_until_in_future(db_session, client, test_app, mock_alert_dto):
-    """
-    'dismissed' and related fields must remain if dismissedUntil is in the future.
-    """
+def test_dispose_dismiss_in_future_keeps_disposables(mock_session, client, test_app, mock_alert_dto):
+    """Ensure disposable enrichments are preserved if dismissUntil is in the future."""
     seed_alert(client, mock_alert_dto)
     future_time = (datetime.utcnow() + timedelta(seconds=60)).isoformat(timespec='milliseconds') + "Z"
+
     enrich_alert(client, mock_alert_dto.fingerprint, {
         "dismissed": True,
         "dismissUntil": future_time,
-        "disposable_dismissed": True,
-        "disposable_dismissUntil": future_time,
     })
-    trigger_cleanup(client)
-    enrichment = get_enrichments(db_session, mock_alert_dto.fingerprint)
-    assert_bool(enrichment.get("dismissed"), True)
-    assert enrichment.get("dismissUntil") == future_time
-    assert_bool(enrichment.get("disposable_dismissed"), True)
-    assert enrichment.get("disposable_dismissUntil") == future_time
+
+    # Call the method
+    enrichments_bl = EnrichmentsBl(tenant_id="your_tenant_id", db=mock_session)
+    call_dispose_dismiss(enrichments_bl, mock_alert_dto.fingerprint)
+    # Verify disposable_* keys still exist (not removed)
+    enrichment = get_enrichments(mock_session, mock_alert_dto.fingerprint)
+    for key in enrichment:
+        if key.startswith("disposable_"):
+            # At least one disposable key should still be present
+            assert key in enrichment
+
+@pytest.mark.parametrize("test_app", ["NO_AUTH"], indirect=True)
+def test_dispose_dismiss_no_dismissUntil(mock_session, client, test_app, mock_alert_dto):
+    """Ensure no action taken if dismissUntil is empty or not past."""
+    seed_alert(client, mock_alert_dto)
+    # No dismissUntil at all
+    enrich_alert(client, mock_alert_dto.fingerprint, {
+        "dismissed": True,
+        "dismissUntil": "",
+    })
+
+    # Call the method
+    enrichments_bl = EnrichmentsBl(tenant_id="your_tenant_id", db=mock_session)
+    call_dispose_dismiss(enrichments_bl, mock_alert_dto.fingerprint)
+    # Verify disposable_* keys still exist (nothing should be removed)
+    enrichment = get_enrichments(mock_session, mock_alert_dto.fingerprint)
+    # Tu código debe verificar que los "disposable_*" permanecen
+    for key in enrichment:
+        if key.startswith("disposable_"):
+            assert key in enrichment

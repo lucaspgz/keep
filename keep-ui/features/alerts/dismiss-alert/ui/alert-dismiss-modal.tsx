@@ -47,7 +47,6 @@ export function AlertDismissModal({
   const revalidateMultiple = useRevalidateMultiple();
   const presetsMutator = () => revalidateMultiple(["/preset"]);
   const { alertsMutator } = useAlerts();
-
   const api = useApi();
   // Ensuring that the useEffect hook is called consistently
   useEffect(() => {
@@ -147,7 +146,7 @@ export function AlertDismissModal({
       beforeTitle={alerts?.[0]?.name}
       title="Dismiss Alert"
     >
-      {alerts && alerts.length > 1 && alerts.every((alert) => alert.dismissed) ? (
+      {alerts && alerts.every((alert) => alert.dismissed) ? (
         <>
           <Subtitle className="text-center">
             Are you sure you want to restore this alert?

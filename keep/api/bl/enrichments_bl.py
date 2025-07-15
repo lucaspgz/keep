@@ -648,7 +648,7 @@ class EnrichmentsBl:
     def batch_enrich(
             self,
             fingerprints: list[str],
-            enrichments_list: list[dict],  # ahora es una lista de dicts
+            enrichments_list: list[dict],
             action_type: ActionType,
             action_callee: str,
             action_description: str,
@@ -659,63 +659,40 @@ class EnrichmentsBl:
             "enriching multiple fingerprints",
             extra={"fingerprints": fingerprints, "tenant_id": self.tenant_id},
         )
-
-        # Validar que la longitud de enrichments_list y fingerprints sea igual
+        # Validate that the length of enrichments_list and fingerprints are equal
         if len(enrichments_list) != len(fingerprints):
-            raise ValueError("La cantidad de enrichments debe coincidir con los fingerprints.")
-
-        # Obtener la sesión
-        session = self.db_session
-
-        # Preparar lista para insertar
-        enrichments_to_save = []
-
-        for idx, fingerprint in enumerate(fingerprints):
-            enrichments = enrichments_list[idx]
-
-            # Si hay que manipular enriquecimientos descartables
-            if dispose_on_new_alert:
+            raise ValueError("The number of enrichments must match the number of fingerprints.")
+        
+        # Prepare the enrichments
+        prepared_enrichments = list(enrichments_list)
+        
+        # if these enrichments are disposable, manipulate them with a timestamp
+        #   so they can be disposed of later
+        if dispose_on_new_alert:
+            for idx, fingerprint in enumerate(fingerprints):
                 self.logger.info(
                     "Enriching disposable enrichments",
                     extra={"fingerprints": [fingerprint], "tenant_id": self.tenant_id},
                 )
+                # for every key, add a disposable key with the value and a timestamp
                 disposable_enrichments = {}
-                for key, value in enrichments.items():
+                for key, value in prepared_enrichments[idx].items():
                     disposable_enrichments[f"disposable_{key}"] = {
                         "value": value,
                         "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).timestamp(),
                     }
-                enrichments.update(disposable_enrichments)
+                prepared_enrichments[idx].update(disposable_enrichments)
 
-            # Buscar si ya existe en la base
-            existing = session.exec(
-                select(AlertEnrichment)
-                .where(AlertEnrichment.tenant_id == self.tenant_id)
-                .where(AlertEnrichment.alert_fingerprint == fingerprint)
-            ).first()
-
-            if existing:
-                # Actualizar
-                existing.enrichments = enrichments
-                session.add(existing)  # opcional, ya que ya está en sesión
-            else:
-                # Crear nuevo
-                enrichments_to_save.append(
-                    AlertEnrichment(
-                        tenant_id=self.tenant_id,
-                        alert_fingerprint=fingerprint,
-                        enrichments=enrichments,
-                    )
-                )
-
-        # Guardar en lote
-        if enrichments_to_save:
-            session.add_all(enrichments_to_save)
-
-        session.commit()
-
-        # Opcional: devolver los objetos guardados
-        return enrichments_to_save
+        batch_enrich(
+            tenant_id=self.tenant_id,
+            fingerprints=fingerprints,
+            enrichments_list=prepared_enrichments,
+            action_type=action_type,
+            action_callee=action_callee,
+            action_description=action_description,
+            session=self.db_session,
+            audit_enabled=audit_enabled,
+        )
 
     def disposable_enrich_entity(
         self,
